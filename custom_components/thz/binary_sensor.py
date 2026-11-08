@@ -19,12 +19,12 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
 )
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
-    DISPLAY_STATUS_BLOCK,
     ENTITY_ID_STYLE_DEFAULT,
     ENTITY_VISIBILITY_DEFAULT,
     should_hide_entity,
@@ -45,6 +45,11 @@ _LOGGER = logging.getLogger(__name__)
 # Read-only sensors backed by a DataUpdateCoordinator: no per-entity polling
 # and no service actions, so updates are not limited.
 PARALLEL_UPDATES = 0
+
+# Bits that several blocks carry, and the block to read them from while it
+# is polled. The compressor bit of pxxFB can stay set while the compressor
+# is off; sDisplay (pxx0A0176) has the state the heat pump's display shows.
+_PREFERRED_BLOCKS = {"compressor": "pxx0A0176"}
 
 
 def _get_device_class(name: str) -> BinarySensorDeviceClass | None:
@@ -102,20 +107,14 @@ async def async_setup_entry(
     entity_id_style = entry_data.entity_id_style
     entity_visibility = entry_data.entity_visibility
     entity_id_prefix = entry_data.entity_id_prefix
-    use_display_compressor = (
-        entry_data.polled_coordinator(DISPLAY_STATUS_BLOCK) is not None
-    )
-    previous_compressor_source = next(
-        (
-            (block, read_field)
-            for block, fields in register_manager.fields().items()
-            if block != DISPLAY_STATUS_BLOCK
-            and entry_data.polled_coordinator(block) is not None
-            for read_field in fields
-            if read_field.name == "compressor"
-        ),
-        None,
-    )
+
+    polled_bits = {
+        (block, read_field.name)
+        for block, fields in register_manager.fields().items()
+        if entry_data.polled_coordinator(block) is not None
+        for read_field in fields
+        if read_field.is_bit
+    }
 
     entities: list[THZBinarySensor] = []
     seen_sensor_names: set[str] = set()
@@ -137,13 +136,11 @@ async def async_setup_entry(
 
             sensor_name = read_field.name
 
-            # Prefer the display indicator whenever its block is available.
-            # Several earlier maps contain a compressor field (pxxF2 comes
-            # before pxxFB), so skip every non-display duplicate here.
+            preferred = _PREFERRED_BLOCKS.get(sensor_name)
             if (
-                use_display_compressor
-                and sensor_name == "compressor"
-                and block != DISPLAY_STATUS_BLOCK
+                preferred is not None
+                and block != preferred
+                and (preferred, sensor_name) in polled_bits
             ):
                 continue
 
@@ -166,20 +163,6 @@ async def async_setup_entry(
                 "icon": read_field.meta.get("icon"),
                 "translation_key": read_field.translation_key,
             }
-            if (
-                use_display_compressor
-                and block == DISPLAY_STATUS_BLOCK
-                and sensor_name == "compressor"
-                and previous_compressor_source is not None
-            ):
-                # Keep the existing entity-registry identity while its data
-                # source changes to the display status block. Preserve the
-                # field that previously won duplicate-name resolution; on
-                # 5.39 this is the pxxF2 compressor flag.
-                entry["unique_id_block"] = bytes.fromhex(
-                    previous_compressor_source[0].removeprefix("pxx")
-                )
-                entry["unique_id_offset"] = previous_compressor_source[1].byte_offset
             entities.append(
                 THZBinarySensor(
                     coordinator,
@@ -193,8 +176,54 @@ async def async_setup_entry(
             )
 
     _LOGGER.debug("Created %d binary sensor entities", len(entities))
+    _adopt_registry_entries(hass, config_entry, entities)
     assign_subdevices(entities, config_entry)
     async_add_entities(entities)
+
+
+@callback
+def _adopt_registry_entries(
+    hass: HomeAssistant,
+    config_entry: THZConfigEntry,
+    entities: list[THZBinarySensor],
+) -> None:
+    """Give a bit read from its preferred block the entry it had before.
+
+    A bit that was read from another block keeps its entity_id, history and
+    settings: its registry entry moves to the unique_id of the new block.
+    """
+    ent_reg = er.async_get(hass)
+    registered = {
+        entry.unique_id: entry
+        for entry in er.async_entries_for_config_entry(ent_reg, config_entry.entry_id)
+        if entry.domain == "binary_sensor"
+    }
+    for entity in entities:
+        name = entity._entity_name
+        unique_id = entity.unique_id
+        if name not in _PREFERRED_BLOCKS or unique_id is None:
+            continue
+        if unique_id in registered:
+            continue
+        prefix = f"thz_{entity._device_id}_bin_"
+        suffix = f"_{name.lower()}"
+        old = next(
+            (
+                entry
+                for old_id, entry in registered.items()
+                if old_id.startswith(prefix) and old_id.endswith(suffix)
+            ),
+            None,
+        )
+        if old is None:
+            continue
+        _LOGGER.debug(
+            "Moving %s from unique_id %s to %s",
+            old.entity_id,
+            old.unique_id,
+            unique_id,
+        )
+        ent_reg.async_update_entity(old.entity_id, new_unique_id=unique_id)
 
 
 class THZBinarySensor(CoordinatorEntity[BlockCoordinator], BinarySensorEntity):
@@ -246,8 +275,6 @@ class THZBinarySensor(CoordinatorEntity[BlockCoordinator], BinarySensorEntity):
         self._offset = entry["offset"]
         self._length = entry["length"]
         self._decode_type = entry["decode"]
-        self._unique_id_block = entry.get("unique_id_block", block)
-        self._unique_id_offset = entry.get("unique_id_offset", self._offset)
         self._device_id = device_id
         self._entity_name = entry["name"]
         self._read_problem = OncePerEpisode(_LOGGER)
@@ -336,8 +363,7 @@ class THZBinarySensor(CoordinatorEntity[BlockCoordinator], BinarySensorEntity):
         """Return a unique identifier for this entity."""
         name_slug = self._entity_name.lower().replace(" ", "_")
         return (
-            f"thz_{self._device_id}_bin_{self._unique_id_block.hex()}_"
-            f"{self._unique_id_offset}_{name_slug}"
+            f"thz_{self._device_id}_bin_{self._block.hex()}_{self._offset}_{name_slug}"
         )
 
     @property
@@ -355,6 +381,7 @@ class THZBinarySensor(CoordinatorEntity[BlockCoordinator], BinarySensorEntity):
     _subdevice: str | None = None
     _subdevice_device_name: str | None = None
     _subdevice_area: str | None = None
+    _subdevice_via_device_id: str | None = None
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -364,4 +391,5 @@ class THZBinarySensor(CoordinatorEntity[BlockCoordinator], BinarySensorEntity):
             self._subdevice,
             self._subdevice_device_name,
             self._subdevice_area,
+            self._subdevice_via_device_id,
         )
